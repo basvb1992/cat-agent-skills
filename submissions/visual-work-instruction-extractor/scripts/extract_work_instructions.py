@@ -270,7 +270,7 @@ def command_package(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir).resolve()
     manifest_path = Path(args.manifest).resolve()
     require(output_dir.is_dir(), "Output directory does not exist")
-    require(manifest_path.parent == output_dir, "manifest.json must be at the output directory root")
+    require(manifest_path.parent == output_dir and manifest_path.name == "manifest.json", "manifest.json must be at the output directory root")
     manifest = load_json(manifest_path)
     manifest["generatedAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_json(manifest_path, manifest)
