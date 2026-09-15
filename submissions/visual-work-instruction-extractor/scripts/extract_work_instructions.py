@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -83,6 +84,12 @@ def is_safe_artifact_file(output_dir: Path, relative_path: str | PurePosixPath) 
         if candidate.is_symlink():
             return False
     return candidate.is_file()
+
+
+def ensure_safe_directory(path: Path, field: str) -> None:
+    require(not path.is_symlink(), f"{field} directory must not be a symlink")
+    require(not path.exists() or path.is_dir(), f"{field} must be a directory")
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def validate_box(value: Any, field: str) -> None:
@@ -271,8 +278,9 @@ def command_render(args: argparse.Namespace) -> None:
     require(input_path.is_file() and input_path.suffix.lower() == ".pdf", "Input must be an existing PDF")
     output_dir = Path(args.output_dir).resolve()
     pages_dir = output_dir / "pages"
-    require(not pages_dir.is_symlink(), "pages directory must not be a symlink")
-    pages_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir = output_dir / "diagnostics"
+    ensure_safe_directory(pages_dir, "pages")
+    ensure_safe_directory(diagnostics_dir, "diagnostics")
     for old_page in pages_dir.glob("page-*.png"):
         old_page.unlink()
     try:
@@ -287,7 +295,7 @@ def command_render(args: argparse.Namespace) -> None:
         bitmap.to_pil().save(pages_dir / f"page-{page_index + 1:04d}.png", format="PNG", optimize=True)
         page.close()
     document.close()
-    write_json(output_dir / "diagnostics" / "render-results.json", {
+    write_json(diagnostics_dir / "render-results.json", {
         "sourceFile": input_path.name,
         "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
         "pageCount": page_index + 1,
@@ -306,6 +314,8 @@ def command_crop(args: argparse.Namespace) -> None:
     require(isinstance(proposal, dict) and proposal.get("schemaVersion") == REGION_VERSION,
             f"Region schemaVersion must be {REGION_VERSION}")
     require(isinstance(proposal.get("pages"), list), "Region pages must be an array")
+    diagnostics_dir = output_dir / "diagnostics"
+    ensure_safe_directory(diagnostics_dir, "diagnostics")
     crops_dir = output_dir / "crops"
     if crops_dir.exists():
         require(not crops_dir.is_symlink(), "crops directory must not be a symlink")
@@ -351,7 +361,7 @@ def command_crop(args: argparse.Namespace) -> None:
                 image.crop(pixel_box).save(destination, format="PNG", optimize=True)
                 results.append({"id": region_id, "output": output, "pixelBox": list(pixel_box),
                                 "width": crop_width, "height": crop_height})
-    write_json(output_dir / "diagnostics" / "crop-results.json", {"crops": results})
+    write_json(diagnostics_dir / "crop-results.json", {"crops": results})
     print(f"Created {len(results)} crop(s)")
 
 
@@ -363,10 +373,16 @@ def command_validate(args: argparse.Namespace) -> None:
 
 
 def command_package(args: argparse.Namespace) -> None:
-    output_dir = Path(args.output_dir).resolve()
+    lexical_output_dir = Path(os.path.abspath(args.output_dir))
+    output_dir = lexical_output_dir.resolve()
     manifest_path = Path(args.manifest).resolve()
     require(output_dir.is_dir(), "Output directory does not exist")
     require(manifest_path == output_dir / "manifest.json", "manifest must be exactly <output-dir>/manifest.json")
+    archive = Path(os.path.abspath(args.archive))
+    resolved_archive = archive.resolve()
+    require(not archive.is_relative_to(lexical_output_dir) and not resolved_archive.is_relative_to(output_dir),
+            "archive must be outside the output directory")
+    require(not archive.is_symlink(), "archive must not be a symlink")
     for required_file in (
         "manifest.json",
         "summary.md",
@@ -377,23 +393,20 @@ def command_package(args: argparse.Namespace) -> None:
     manifest = load_json(manifest_path)
     manifest["generatedAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_json(manifest_path, manifest)
-    validate_manifest_data(manifest, output_dir)
-    archive = Path(args.archive).resolve()
-    require(not archive.is_relative_to(output_dir), "archive must be outside the output directory")
+    references = validate_manifest_data(manifest, output_dir)
+    packaged_artifacts = sorted(set(references) | {
+        "diagnostics/crop-results.json",
+        "diagnostics/region-proposals.json",
+    })
     archive.parent.mkdir(parents=True, exist_ok=True)
     if archive.exists():
         archive.unlink()
     included = 0
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
-        for root_name in ("pages", "crops", "diagnostics"):
-            root = output_dir / root_name
-            if not root.is_dir() or root.is_symlink():
-                continue
-            for source in sorted(root.rglob("*")):
-                relative = source.relative_to(output_dir)
-                if source.is_file() and not source.is_symlink() and "__pycache__" not in relative.parts:
-                    bundle.write(source, relative.as_posix())
-                    included += 1
+        for relative in packaged_artifacts:
+            require(is_safe_artifact_file(output_dir, relative), f"{relative} is missing or unsafe")
+            bundle.write(output_dir / Path(relative), relative)
+            included += 1
         for root_file in ("manifest.json", "summary.md"):
             source = output_dir / root_file
             require(source.is_file() and not source.is_symlink(), f"{root_file} is required")
@@ -512,11 +525,30 @@ def command_self_test(_: argparse.Namespace) -> None:
             ),
             "non-positive region page",
         )
+        (root / "pages/stale-page.png").write_bytes(b"stale-page")
+        write_json(root / "diagnostics/render-results.json", {
+            "sourceFile": "test.pdf",
+            "sha256": "0" * 64,
+            "pageCount": 1,
+            "dpi": 220,
+        })
+        expect_failure(
+            lambda: command_package(
+                argparse.Namespace(
+                    output_dir=str(root),
+                    manifest=str(manifest_path),
+                    archive=str(root / "archive.zip"),
+                )
+            ),
+            "archive inside output directory",
+        )
         archive = root.parent / "self-test.zip"
         command_package(argparse.Namespace(output_dir=str(root), manifest=str(manifest_path), archive=str(archive)))
         with zipfile.ZipFile(archive) as bundle:
             require({"manifest.json", "summary.md", "pages/page-0001.png", "diagnostics/crop-results.json",
                      "diagnostics/region-proposals.json"}.issubset(bundle.namelist()), "Self-test archive is incomplete")
+            require({"pages/stale-page.png", "diagnostics/render-results.json"}.isdisjoint(bundle.namelist()),
+                    "Self-test archive contains unreferenced files")
         archive.unlink()
     print("Self-test passed")
 
