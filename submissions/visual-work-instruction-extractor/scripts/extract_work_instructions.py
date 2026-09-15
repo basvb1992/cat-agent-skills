@@ -87,6 +87,25 @@ def validate_box(value: Any, field: str) -> None:
     require(left < right and top < bottom, f"{field} must have positive width and height")
 
 
+def validate_region_page_entry(page_entry: Any) -> PurePosixPath:
+    require(isinstance(page_entry, dict), "Each region page must be an object")
+
+    page_number = page_entry.get("page")
+    require(
+        isinstance(page_number, int)
+        and not isinstance(page_number, bool)
+        and page_number >= 1,
+        "region page must be a positive integer",
+    )
+
+    image_path = safe_relative_path(page_entry.get("image"), "region page image")
+    require(
+        image_path.as_posix() == f"pages/page-{page_number:04d}.png",
+        "region page image must match its page number",
+    )
+    return image_path
+
+
 def validate_warning(value: Any, field: str, page_numbers: set[int]) -> None:
     require(isinstance(value, dict), f"{field} must be an object")
     require_keys(value, {"text", "severity", "sourcePage"}, WARNING_KEYS, field)
@@ -284,14 +303,8 @@ def command_crop(args: argparse.Namespace) -> None:
     results: list[dict[str, Any]] = []
     seen_outputs: set[str] = set()
     for page_entry in proposal["pages"]:
-        require(isinstance(page_entry, dict), "Each region page must be an object")
-        page_number = page_entry.get("page")
-        require(isinstance(page_number, int) and not isinstance(page_number, bool) and page_number >= 1,
-                "region page must be a positive integer")
-        image_path = safe_relative_path(page_entry.get("image"), "region page image", {"pages"})
-        require(image_path.as_posix() == f"pages/page-{page_number:04d}.png",
-                "region page image must match its page number")
-        source_path = output_dir / Path(image_path)
+        image_path = validate_region_page_entry(page_entry)
+        source_path = output_dir / Path(str(image_path))
         require(source_path.is_file() and not source_path.is_symlink(), f"Page image is missing or unsafe: {image_path}")
         require(isinstance(page_entry.get("regions"), list), "regions must be an array")
         with Image.open(source_path) as image:
@@ -405,8 +418,39 @@ def command_self_test(_: argparse.Namespace) -> None:
         bad_box["document"] = {**manifest["document"], "extra": True}
         expect_failure(lambda: validate_manifest_data(bad_box), "unknown properties")
         bad_region = root / "bad-region.json"
-        write_json(bad_region, {"schemaVersion": REGION_VERSION, "pages": [{"page": 2, "image": "pages/page-0001.png", "regions": []}]})
-        expect_failure(lambda: (_ for _ in ()).throw(ValidationError("page/image mismatch")), "region page/image mismatch")
+        write_json(
+            bad_region,
+            {
+                "schemaVersion": REGION_VERSION,
+                "pages": [
+                    {
+                        "page": 2,
+                        "image": "pages/page-0001.png",
+                        "regions": [],
+                    }
+                ],
+            },
+        )
+
+        def validate_bad_region() -> None:
+            proposal = load_json(bad_region)
+            require(isinstance(proposal, dict), "proposal must be an object")
+            validate_region_page_entry(proposal["pages"][0])
+
+        expect_failure(validate_bad_region, "region page/image mismatch")
+        validate_region_page_entry({"page": 1, "image": "pages/page-0001.png", "regions": []})
+        expect_failure(
+            lambda: validate_region_page_entry(
+                {"page": True, "image": "pages/page-0001.png", "regions": []}
+            ),
+            "boolean region page",
+        )
+        expect_failure(
+            lambda: validate_region_page_entry(
+                {"page": 0, "image": "pages/page-0000.png", "regions": []}
+            ),
+            "non-positive region page",
+        )
         archive = root.parent / "self-test.zip"
         command_package(argparse.Namespace(output_dir=str(root), manifest=str(manifest_path), archive=str(archive)))
         with zipfile.ZipFile(archive) as bundle:
