@@ -283,14 +283,20 @@ def command_package(args: argparse.Namespace) -> None:
     if archive.exists():
         archive.unlink()
     included = 0
+    allowed_roots = {"pages", "crops", "diagnostics"}
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         for source in sorted(output_dir.rglob("*")):
+            relative = source.relative_to(output_dir)
             if (
                 source.is_file()
                 and not source.is_symlink()
-                and "__pycache__" not in source.parts
+                and "__pycache__" not in relative.parts
+                and (
+                    relative.as_posix() in {"manifest.json", "summary.md"}
+                    or relative.parts[0] in allowed_roots
+                )
             ):
-                bundle.write(source, source.relative_to(output_dir).as_posix())
+                bundle.write(source, relative.as_posix())
                 included += 1
     print(f"Packaged {included} file(s) in {archive}")
 
