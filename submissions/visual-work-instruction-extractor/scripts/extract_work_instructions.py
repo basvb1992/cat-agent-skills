@@ -76,6 +76,15 @@ def safe_relative_path(value: Any, field: str, roots: set[str] | None = None) ->
     return path
 
 
+def is_safe_artifact_file(output_dir: Path, relative_path: str | PurePosixPath) -> bool:
+    candidate = output_dir
+    for part in PurePosixPath(relative_path).parts:
+        candidate /= part
+        if candidate.is_symlink():
+            return False
+    return candidate.is_file()
+
+
 def validate_box(value: Any, field: str) -> None:
     if value is None:
         return
@@ -154,6 +163,7 @@ def validate_manifest_data(manifest: Any, output_dir: Path | None = None) -> lis
     pages = manifest["pages"]
     require(isinstance(pages, list) and pages, "pages must contain at least one page")
     page_numbers: set[int] = set()
+    page_review_required = False
     referenced_paths: list[str] = []
     for index, page in enumerate(pages):
         field = f"pages[{index}]"
@@ -168,6 +178,8 @@ def validate_manifest_data(manifest: Any, output_dir: Path | None = None) -> lis
         referenced_paths.append(image.as_posix())
         require(page["title"] is None or isinstance(page["title"], str), f"{field}.title must be a string or null")
         require(page["status"] in VALID_STATUSES, f"{field}.status is invalid")
+        if page["status"] == "review-required":
+            page_review_required = True
         validate_string_array(page.get("reviewReasons", []), f"{field}.reviewReasons")
         require(isinstance(page["warnings"], list), f"{field}.warnings must be an array")
     for index, page in enumerate(pages):
@@ -190,7 +202,8 @@ def validate_manifest_data(manifest: Any, output_dir: Path | None = None) -> lis
         require(sequence is None or (isinstance(sequence, int) and not isinstance(sequence, bool) and sequence >= 1),
                 f"{field}.sequence must be a positive integer or null")
         source_page = instruction["sourcePage"]
-        require(isinstance(source_page, int) and source_page in page_numbers, f"{field}.sourcePage does not identify a page")
+        require(isinstance(source_page, int) and not isinstance(source_page, bool) and source_page in page_numbers,
+                f"{field}.sourcePage does not identify a page")
         validate_box(instruction["sourceRegion"], f"{field}.sourceRegion")
         for nullable_field in ("title", "action", "component", "location"):
             require(instruction[nullable_field] is None or isinstance(instruction[nullable_field], str),
@@ -228,8 +241,8 @@ def validate_manifest_data(manifest: Any, output_dir: Path | None = None) -> lis
     require(review_required_ids.issubset(set(review["instructionIds"])),
             "All review-required instructions must appear in review.instructionIds")
     validate_string_array(review["notes"], "review.notes")
-    require(review["required"] == bool(review_required_ids or review["notes"]),
-            "review.required must reflect review-required instructions or review notes")
+    require(review["required"] == bool(page_review_required or review_required_ids or review["notes"]),
+            "review.required must reflect review-required pages, instructions, or review notes")
 
     if output_dir is not None:
         render_results = output_dir / "diagnostics" / "render-results.json"
@@ -239,8 +252,9 @@ def validate_manifest_data(manifest: Any, output_dir: Path | None = None) -> lis
                     "diagnostics/render-results.json.pageCount must be a positive integer")
             require(page_numbers == set(range(1, rendered["pageCount"] + 1)),
                     "Manifest pages must cover every rendered page")
-        missing = [value for value in sorted(set(referenced_paths)) if not (output_dir / Path(value)).is_file()]
-        require(not missing, "Referenced files are missing: " + ", ".join(missing))
+        unsafe = [value for value in sorted(set(referenced_paths))
+                  if not is_safe_artifact_file(output_dir, value)]
+        require(not unsafe, "Referenced files are missing or unsafe: " + ", ".join(unsafe))
     return sorted(set(referenced_paths))
 
 
@@ -257,6 +271,7 @@ def command_render(args: argparse.Namespace) -> None:
     require(input_path.is_file() and input_path.suffix.lower() == ".pdf", "Input must be an existing PDF")
     output_dir = Path(args.output_dir).resolve()
     pages_dir = output_dir / "pages"
+    require(not pages_dir.is_symlink(), "pages directory must not be a symlink")
     pages_dir.mkdir(parents=True, exist_ok=True)
     for old_page in pages_dir.glob("page-*.png"):
         old_page.unlink()
@@ -305,7 +320,7 @@ def command_crop(args: argparse.Namespace) -> None:
     for page_entry in proposal["pages"]:
         image_path = validate_region_page_entry(page_entry)
         source_path = output_dir / Path(str(image_path))
-        require(source_path.is_file() and not source_path.is_symlink(), f"Page image is missing or unsafe: {image_path}")
+        require(is_safe_artifact_file(output_dir, image_path), f"Page image is missing or unsafe: {image_path}")
         require(isinstance(page_entry.get("regions"), list), "regions must be an array")
         with Image.open(source_path) as image:
             width, height = image.size
@@ -352,9 +367,13 @@ def command_package(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest).resolve()
     require(output_dir.is_dir(), "Output directory does not exist")
     require(manifest_path == output_dir / "manifest.json", "manifest must be exactly <output-dir>/manifest.json")
-    for required_file in ("summary.md", "diagnostics/crop-results.json", "diagnostics/region-proposals.json"):
-        path = output_dir / required_file
-        require(path.is_file() and not path.is_symlink(), f"{required_file} is required")
+    for required_file in (
+        "manifest.json",
+        "summary.md",
+        "diagnostics/crop-results.json",
+        "diagnostics/region-proposals.json",
+    ):
+        require(is_safe_artifact_file(output_dir, required_file), f"{required_file} is required and must not be a symlink")
     manifest = load_json(manifest_path)
     manifest["generatedAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_json(manifest_path, manifest)
@@ -417,6 +436,48 @@ def command_self_test(_: argparse.Namespace) -> None:
         bad_box["pages"] = [{**manifest["pages"][0], "image": "pages/page-0001.png"}]
         bad_box["document"] = {**manifest["document"], "extra": True}
         expect_failure(lambda: validate_manifest_data(bad_box), "unknown properties")
+        bad_page_review = {
+            **manifest,
+            "pages": [
+                {
+                    **manifest["pages"][0],
+                    "status": "review-required",
+                    "reviewReasons": ["Page requires review."],
+                }
+            ],
+        }
+        expect_failure(lambda: validate_manifest_data(bad_page_review), "page review requirement")
+        valid_page_review = {
+            **bad_page_review,
+            "review": {"required": True, "instructionIds": [], "notes": []},
+        }
+        validate_manifest_data(valid_page_review)
+        bad_source_page = {
+            **manifest,
+            "instructions": [
+                {
+                    "id": "test-instruction",
+                    "sequence": 1,
+                    "sourcePage": True,
+                    "sourceRegion": None,
+                    "title": "Test",
+                    "action": "Test",
+                    "component": None,
+                    "location": None,
+                    "partNumbers": [],
+                    "toolsAndMaterials": [],
+                    "warnings": [],
+                    "evidenceImage": None,
+                    "photoImage": None,
+                    "fullPageFallback": "pages/page-0001.png",
+                    "confidence": 1,
+                    "status": "verified",
+                    "reviewReasons": [],
+                    "extractionMethod": "manual",
+                }
+            ],
+        }
+        expect_failure(lambda: validate_manifest_data(bad_source_page), "boolean instruction source page")
         bad_region = root / "bad-region.json"
         write_json(
             bad_region,
